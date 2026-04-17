@@ -122,6 +122,7 @@ R — сброс положения машины
 H — очистить следы
 C — показ/скрытие предполагаемой окружности разворота (ICR)
 B — показ/скрытие hit box кузова
+T — режим следа: <span id="tracksMode">все колёса</span>
 W — режим задней оси: <span id="rearMode">прямо</span>
 Клик мышью — рулетка (2 точки)
 Esc — убрать все рулетки</div>
@@ -144,6 +145,7 @@ Esc — убрать все рулетки</div>
   <div id="actionBtns">
     <button class="action-btn" data-action="envMenu" id="btnEnv">Окружение…</button>
     <button class="action-btn" data-action="KeyW" id="btnW">Задние: прямо</button>
+    <button class="action-btn" data-action="KeyT" id="btnT">След: все колёса</button>
     <button class="action-btn" data-action="KeyC">Окружность ICR</button>
     <button class="action-btn" data-action="KeyR">Сброс машины</button>
     <button class="action-btn" data-action="KeyH">Очистить следы</button>
@@ -220,6 +222,10 @@ Esc — убрать все рулетки</div>
     dir: 0,
     speed: 0,            // текущая скорость (px/sec), знаковая. Меняется
                          // плавно через инертность — см. step().
+    // sweepSegs: история положений хитбокса для режима «заметающая зона».
+    // Каждый сегмент — массив snapshot'ов; snapshot = 8 вершин восьмиугольника
+    // в мировых координатах ([[x,y], ...]).
+    sweepSegs: [[]],
     // следы 4-х колёс: FL, FR, RL, RR; каждый след — массив сегментов-полилиний,
     // чтобы после телепортации (сброса) старые и новые точки не соединялись
     tracks: [[[]], [[]], [[]], [[]]],
@@ -259,6 +265,50 @@ Esc — убрать все рулетки</div>
   }
   state.trackColors.push(dirtyColor());
 
+  // ---------- Режим следа (T) ----------
+  // 0: без следа
+  // 1: следы шин (все 4 колеса)
+  // 2: следы только внешних к повороту колёс (1 переднее + 1 заднее);
+  //    при прямом руле / крабе ничего не пишется
+  // 3: заметающая зона корпуса (swept area)
+  const TRACKS_MODE_OFF   = 0;
+  const TRACKS_MODE_ALL   = 1;
+  const TRACKS_MODE_OUTER = 2;
+  const TRACKS_MODE_SWEPT = 3;
+  const TRACKS_MODE_LABELS = {
+    0: 'выкл', 1: 'все колёса', 2: 'внешние колёса', 3: 'заметающая зона'
+  };
+  const TRACKS_STORAGE_KEY = 'wheelsDemo.tracks';
+  let tracksMode = TRACKS_MODE_ALL;
+  // Последняя «внешняя маска» для 4 колёс — чтобы при смене стороны
+  // поворота разрывать сегменты только у колёс, которые начали/перестали
+  // быть внешними. При прямом руле / крабе / смене режима — null.
+  let lastOuterMask = null;
+  try {
+    const saved = parseInt(localStorage.getItem(TRACKS_STORAGE_KEY), 10);
+    if (!isNaN(saved) && saved >= 0 && saved <= 3) tracksMode = saved;
+  } catch (e) {}
+
+  // Начинает новый сегмент во всех видах следов — используется при
+  // переключении режима, сбросе машины, смене окружения. Не стирает
+  // существующие сегменты (для «не стирать при переключении T»).
+  function startNewTrackSegment() {
+    for (let i = 0; i < 4; i++) state.tracks[i].push([]);
+    state.trackColors.push(dirtyColor());
+    state.sweepSegs.push([]);
+  }
+
+  function setTracksMode(m) {
+    tracksMode = m;
+    try { localStorage.setItem(TRACKS_STORAGE_KEY, String(m)); } catch (e) {}
+    lastOuterMask = null;
+    startNewTrackSegment();
+    const el = document.getElementById('tracksMode');
+    if (el) el.textContent = TRACKS_MODE_LABELS[m];
+    const btn = document.getElementById('btnT');
+    if (btn) btn.textContent = 'След: ' + TRACKS_MODE_LABELS[m];
+  }
+
   // Сбрасывает только положение / ориентацию / углы колёс.
   // Следы шин и режим задней оси сохраняются, но начинается новый сегмент,
   // чтобы старый след не соединялся с новой траекторией.
@@ -276,8 +326,7 @@ Esc — убрать все рулетки</div>
     state.deltaR = 0;
     state.dir = 0;
     state.speed = 0;
-    for (let i = 0; i < 4; i++) state.tracks[i].push([]);
-    state.trackColors.push(dirtyColor());
+    startNewTrackSegment();
     collided = false;
     collisionPos = null;
     collisionCount = 0;
@@ -748,6 +797,7 @@ Esc — убрать все рулетки</div>
     // По ТЗ: смена окружения очищает следы и рулетки.
     state.tracks       = [[[]], [[]], [[]], [[]]];
     state.trackColors  = [dirtyColor()];
+    state.sweepSegs    = [[]];
     ruler.pending      = null;
     ruler.segments     = [];
 
@@ -897,6 +947,9 @@ Esc — убрать все рулетки</div>
     else if (code === 'KeyH') {
       state.tracks = [[[]], [[]], [[]], [[]]];
       state.trackColors = [dirtyColor()];
+      state.sweepSegs = [[]];
+    } else if (code === 'KeyT') {
+      setTracksMode((tracksMode + 1) % 4);
     } else if (code === 'KeyW') {
       state.rearMode = (state.rearMode + 1) % REAR_MODES.length;
       updateRearModeHud();
@@ -992,15 +1045,33 @@ Esc — убрать все рулетки</div>
   // Кнопки выбора окружения. На десктопе панель всегда видна, на мобиле
   // показывается по тапу на кнопку «Окружение…»; после выбора панель
   // закрывается и в мобильной кнопке выводится название активного окружения.
+  // Выбор окружения запоминается в localStorage и восстанавливается при
+  // перезагрузке страницы.
+  const ENV_STORAGE_KEY = 'wheelsDemo.env';
+  function updateMobileEnvBtnLabel(key) {
+    const mobileBtn = document.getElementById('btnEnv');
+    if (!mobileBtn) return;
+    const btn = document.querySelector(`#envPanel button[data-env="${key}"]`);
+    if (btn) mobileBtn.textContent = btn.textContent;
+  }
   document.querySelectorAll('#envPanel button').forEach(btn => {
     btn.addEventListener('click', () => {
       setEnvironment(btn.dataset.env);
       document.body.classList.remove('env-open');
-      const mobileBtn = document.getElementById('btnEnv');
-      if (mobileBtn) mobileBtn.textContent = btn.textContent;
+      updateMobileEnvBtnLabel(btn.dataset.env);
+      try { localStorage.setItem(ENV_STORAGE_KEY, btn.dataset.env); } catch (e) {}
     });
   });
-  setEnvironment('empty');
+  let initialEnv = 'road4';
+  try {
+    const saved = localStorage.getItem(ENV_STORAGE_KEY);
+    if (saved && ENVIRONMENTS[saved]) initialEnv = saved;
+  } catch (e) {}
+  setEnvironment(initialEnv);
+  updateMobileEnvBtnLabel(initialEnv);
+  // Применяем режим следа из localStorage (или дефолтный); заодно
+  // обновляется HUD и подпись мобильной кнопки «След: ...».
+  setTracksMode(tracksMode);
 
   canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
@@ -1229,15 +1300,55 @@ Esc — убрать все рулетки</div>
       collided = false;
     }
 
-    // 5. Запись следов колёс — в последний (текущий) сегмент каждого колеса
+    // 5. Запись следов в зависимости от текущего режима (T).
     const wp = wheelPositions(s);
     const keysArr = ['FL','FR','RL','RR'];
-    for (let i = 0; i < 4; i++) {
-      const segs = s.tracks[i];
+    // Для режима «внешние колёса» нужно определить, какое колесо каждой
+    // оси дальше от ICR. При прямом руле / крабе ICR нет — пропускаем запись.
+    let outerMask = null;
+    if (tracksMode === TRACKS_MODE_OUTER) {
+      const icr = computeICR(s);
+      if (icr) {
+        const dFL = Math.hypot(wp.FL.x - icr.x, wp.FL.y - icr.y);
+        const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
+        const dRL = Math.hypot(wp.RL.x - icr.x, wp.RL.y - icr.y);
+        const dRR = Math.hypot(wp.RR.x - icr.x, wp.RR.y - icr.y);
+        outerMask = [dFL > dFR, dFR >= dFL, dRL > dRR, dRR >= dRL];
+      }
+    }
+    if (tracksMode === TRACKS_MODE_ALL || outerMask) {
+      // Если маска изменилась у какого-то колеса (перешло через прямой
+      // руль / сменилась сторона) — закрываем его текущий сегмент, чтобы
+      // новая ветвь не соединилась линией со старой.
+      if (outerMask) {
+        for (let i = 0; i < 4; i++) {
+          const was = lastOuterMask ? lastOuterMask[i] : false;
+          if (was && !outerMask[i]) s.tracks[i].push([]);
+        }
+      }
+      for (let i = 0; i < 4; i++) {
+        if (outerMask && !outerMask[i]) continue;
+        const segs = s.tracks[i];
+        let seg   = segs[segs.length - 1];
+        // Первый снимок маски после паузы (lastOuterMask=null) для этого
+        // колеса — тоже начинаем новый сегмент, чтобы прежний отрезок
+        // «все колёса» не соединился с новой линией.
+        if (outerMask && (!lastOuterMask || !lastOuterMask[i]) && seg.length > 0) {
+          segs.push([]);
+          seg = segs[segs.length - 1];
+        }
+        const w = wp[keysArr[i]];
+        seg.push([w.x, w.y]);
+        if (seg.length > 4000) seg.splice(0, seg.length - 4000);
+      }
+    }
+    lastOuterMask = outerMask;
+    // Заметающая зона: сохраняем snapshot восьмиугольника хитбокса.
+    if (tracksMode === TRACKS_MODE_SWEPT) {
+      const corners = carCorners(s).map(p => [p.x, p.y]);
+      const segs = s.sweepSegs;
       const seg  = segs[segs.length - 1];
-      const w = wp[keysArr[i]];
-      seg.push([w.x, w.y]);
-      // ограничиваем длину текущего сегмента, чтобы не съедать память
+      seg.push(corners);
       if (seg.length > 4000) seg.splice(0, seg.length - 4000);
     }
   }
@@ -1257,6 +1368,70 @@ Esc — убрать все рулетки</div>
         ctx.stroke();
       }
     }
+  }
+
+  // Выпуклая оболочка по Andrew's monotone chain — используется для
+  // объединения двух восьмиугольников подряд в одну капсулу для swept-area.
+  function convexHull(points) {
+    const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cross = (o, a, b) => (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]);
+    const lower = [];
+    for (const p of pts) {
+      while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop();
+      lower.push(p);
+    }
+    const upper = [];
+    for (let i = pts.length - 1; i >= 0; i--) {
+      const p = pts[i];
+      while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop();
+      upper.push(p);
+    }
+    upper.pop(); lower.pop();
+    return lower.concat(upper);
+  }
+
+  function drawSwept() {
+    // На асфальте — более светлая заливка, иначе приглушённо-тёплая.
+    const fill = onAsphalt() ? 'rgba(255,230,160,0.14)'
+                             : 'rgba(120,90,50,0.18)';
+    const stroke = onAsphalt() ? 'rgba(255,230,160,0.35)'
+                               : 'rgba(120,90,50,0.35)';
+    ctx.fillStyle = fill;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 1 / view.zoom;
+    for (const snapshots of state.sweepSegs) {
+      if (snapshots.length === 0) continue;
+      // Сам восьмиугольник первого snapshot
+      fillOctagonPath(snapshots[0]);
+      ctx.fill();
+      // Капсулы между соседними snapshot'ами через convex hull 16 точек
+      for (let i = 1; i < snapshots.length; i++) {
+        const combined = snapshots[i - 1].concat(snapshots[i]);
+        const hull = convexHull(combined);
+        ctx.beginPath();
+        ctx.moveTo(hull[0][0], hull[0][1]);
+        for (let j = 1; j < hull.length; j++) ctx.lineTo(hull[j][0], hull[j][1]);
+        ctx.closePath();
+        ctx.fill();
+      }
+      // Контур оболочки всего сегмента — чуть подчёркивает границы
+      if (snapshots.length >= 2) {
+        const all = [];
+        for (const s of snapshots) for (const p of s) all.push(p);
+        const hull = convexHull(all);
+        ctx.beginPath();
+        ctx.moveTo(hull[0][0], hull[0][1]);
+        for (let j = 1; j < hull.length; j++) ctx.lineTo(hull[j][0], hull[j][1]);
+        ctx.closePath();
+        ctx.stroke();
+      }
+    }
+  }
+  function fillOctagonPath(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
   }
 
   // Светлая размытая подложка под колесо — повышает контраст между нашим
@@ -1385,9 +1560,11 @@ Esc — убрать все рулетки</div>
   }
 
   function drawScaleBar() {
-    // размещается под HUD-блоком слева сверху; длина отрезка реагирует на zoom
+    // размещается над панелью углов поворота (внизу слева); длина отрезка
+    // реагирует на zoom. anglesHud ~ 48 px высотой + 12 px bottom-offset,
+    // поэтому ставим выше на ~30 px.
     const x = 22;
-    const y = 180;
+    const y = canvas.height - 82;
     const tick = 5;
     const barLen = PPM * view.zoom;
     ctx.save();
@@ -1660,6 +1837,7 @@ Esc — убрать все рулетки</div>
     ctx.translate(view.offsetX, view.offsetY);
     ctx.scale(view.zoom, view.zoom);
     drawEnvironment();      // асфальт, разметка, бордюры — под всем
+    drawSwept();            // заметающая зона — под линиями следов
     drawTracks();
     drawTurnCircleBack();   // пунктирная окружность — под машиной
     drawCar();
