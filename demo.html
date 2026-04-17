@@ -222,9 +222,21 @@ Esc — убрать все рулетки</div>
   window.addEventListener('keyup', e => { keys[e.code] = false; });
 
   // ---------- Мобильные кнопки ----------
-  const isMobile = ('ontouchstart' in window)
-                || navigator.maxTouchPoints > 0
-                || window.matchMedia('(pointer: coarse)').matches;
+  // Надёжная эвристика: комбинируем coarse-pointer, touch-API, User-Agent
+  // (iPhone/iPad/iPod/Android), ширину вьюпорта и iPadOS с несколькими
+  // тач-точками (который по умолчанию прикидывается Mac). Плюс явный флаг
+  // ?mobile=1 — можно форсить на любом устройстве, если автоопределение
+  // промахнулось (актуально для Files app на iOS с урезанным WebView).
+  const ua = navigator.userAgent || '';
+  const isIPadOS = navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1;
+  const forceMobile = /[?&]mobile=1\b/.test(location.search);
+  const isMobile = forceMobile
+                || /iPhone|iPad|iPod|Android|Mobile/i.test(ua)
+                || isIPadOS
+                || window.matchMedia('(pointer: coarse)').matches
+                || 'ontouchstart' in window
+                || (navigator.maxTouchPoints || 0) > 0
+                || Math.min(window.innerWidth, window.innerHeight) <= 820;
   if (isMobile) document.body.classList.add('mobile');
 
   // D-pad: удерживаем «клавишу», пока нажата кнопка
