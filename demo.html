@@ -2,10 +2,12 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Wheels — PoC</title>
 <style>
-  html, body { margin: 0; padding: 0; overflow: hidden; background: #f2efe9; }
-  canvas { display: block; }
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #f2efe9;
+               -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { display: block; touch-action: none; }
   .hud-box {
     position: fixed;
     font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -15,6 +17,42 @@
   }
   #hud       { top:  10px; left:  12px; }
   #anglesHud { bottom: 12px; left: 12px; }
+
+  /* Мобильная раскладка: включается, если у устройства coarse-указатель. */
+  #mobileControls { display: none; }
+  body.mobile #hud { display: none; }
+  body.mobile #anglesHud { top: 10px; bottom: auto; left: 10px; right: 10px; font-size: 12px; }
+  body.mobile #mobileControls { display: block; }
+
+  #mobileControls { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+  #dpad {
+    position: absolute; left: 14px; bottom: 14px;
+    display: grid; grid-template-columns: repeat(3, 58px); grid-template-rows: repeat(3, 58px); gap: 4px;
+    pointer-events: auto;
+  }
+  .dpad-btn {
+    background: rgba(0,0,0,0.38); color: #fff; border: none; border-radius: 12px;
+    font-size: 22px; font-weight: 700;
+    touch-action: none; -webkit-tap-highlight-color: transparent;
+  }
+  .dpad-btn:active { background: rgba(0,0,0,0.6); }
+  .dpad-up    { grid-column: 2; grid-row: 1; }
+  .dpad-left  { grid-column: 1; grid-row: 2; }
+  .dpad-right { grid-column: 3; grid-row: 2; }
+  .dpad-down  { grid-column: 2; grid-row: 3; }
+
+  #actionBtns {
+    position: absolute; right: 14px; bottom: 14px;
+    display: flex; flex-direction: column; gap: 6px; align-items: flex-end;
+    pointer-events: auto;
+  }
+  .action-btn {
+    background: rgba(0,0,0,0.38); color: #fff; border: none; border-radius: 20px;
+    padding: 10px 14px; font-size: 14px; font-weight: 600;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+    min-width: 120px; text-align: center;
+  }
+  .action-btn:active { background: rgba(0,0,0,0.6); }
 </style>
 </head>
 <body>
@@ -28,6 +66,21 @@ W — режим задней оси: <span id="rearMode">прямо</span>
 Esc — убрать все рулетки</div>
 <div id="anglesHud" class="hud-box">Углы поворота колес: передние 0°, задние 0°
 Радиус разворота: — (едет прямо)</div>
+<div id="mobileControls">
+  <div id="dpad">
+    <button class="dpad-btn dpad-up"    data-key="ArrowUp">▲</button>
+    <button class="dpad-btn dpad-left"  data-key="ArrowLeft">◀</button>
+    <button class="dpad-btn dpad-right" data-key="ArrowRight">▶</button>
+    <button class="dpad-btn dpad-down"  data-key="ArrowDown">▼</button>
+  </div>
+  <div id="actionBtns">
+    <button class="action-btn" data-action="KeyW" id="btnW">Задние: прямо</button>
+    <button class="action-btn" data-action="KeyC">Окружность ICR</button>
+    <button class="action-btn" data-action="KeyR">Сброс машины</button>
+    <button class="action-btn" data-action="KeyH">Очистить следы</button>
+    <button class="action-btn" data-action="Escape">Убрать рулетки</button>
+  </div>
+</div>
 <script>
 (() => {
   const canvas = document.getElementById('c');
@@ -126,49 +179,147 @@ Esc — убрать все рулетки</div>
   function updateRearModeHud() {
     const el = document.getElementById('rearMode');
     if (el) el.textContent = REAR_MODES[state.rearMode].label;
+    const btn = document.getElementById('btnW');
+    if (btn) btn.textContent = 'Задние: ' + REAR_MODES[state.rearMode].label;
   }
   updateRearModeHud();
 
+  // ---------- Камера (zoom + pan) ----------
+  // Мировые координаты (s.x, s.y, следы, рулетки) остаются в «игровых пикселях»
+  // при опорном PPM. При рендере применяется трансформация screen = world·zoom + offset.
+  const view = { zoom: 1, offsetX: 0, offsetY: 0 };
+  function screenToWorld(sx, sy) {
+    return { x: (sx - view.offsetX) / view.zoom, y: (sy - view.offsetY) / view.zoom };
+  }
+
   // ---------- Ввод ----------
   const keys = Object.create(null);
-  // Рулетка
+  // Рулетка (все координаты — мировые)
   const ruler = {
     segments: [],   // зафиксированные: [{a:{x,y}, b:{x,y}}, ...]
     pending: null,  // первая точка текущего измерения (до второго клика)
     mouse: { x: 0, y: 0, inside: false }
   };
-  window.addEventListener('keydown', e => {
-    keys[e.code] = true;
-    if (e.code === 'KeyR') reset();
-    if (e.code === 'KeyH') {
+  function handleAction(code) {
+    if (code === 'KeyR') reset();
+    else if (code === 'KeyH') {
       state.tracks = [[[]], [[]], [[]], [[]]];
       state.trackColors = [dirtyColor()];
-    }
-    if (e.code === 'KeyW') {
+    } else if (code === 'KeyW') {
       state.rearMode = (state.rearMode + 1) % REAR_MODES.length;
       updateRearModeHud();
-    }
-    if (e.code === 'KeyC') showTurnCircle = !showTurnCircle;
-    if (e.code === 'Escape') {
+    } else if (code === 'KeyC') showTurnCircle = !showTurnCircle;
+    else if (code === 'Escape') {
       if (ruler.pending) ruler.pending = null;
       else ruler.segments = [];
     }
+  }
+  window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    handleAction(e.code);
     if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
   });
   window.addEventListener('keyup', e => { keys[e.code] = false; });
 
+  // ---------- Мобильные кнопки ----------
+  const isMobile = ('ontouchstart' in window)
+                || navigator.maxTouchPoints > 0
+                || window.matchMedia('(pointer: coarse)').matches;
+  if (isMobile) document.body.classList.add('mobile');
+
+  // D-pad: удерживаем «клавишу», пока нажата кнопка
+  document.querySelectorAll('.dpad-btn').forEach(btn => {
+    const code = btn.dataset.key;
+    const press   = e => { e.preventDefault(); keys[code] = true;  btn.setPointerCapture && btn.setPointerCapture(e.pointerId); };
+    const release = e => { e.preventDefault(); keys[code] = false; };
+    btn.addEventListener('pointerdown',  press);
+    btn.addEventListener('pointerup',    release);
+    btn.addEventListener('pointercancel',release);
+    btn.addEventListener('pointerleave', release);
+    btn.addEventListener('contextmenu',  e => e.preventDefault());
+  });
+  // Кнопки действий: дёргают ту же логику, что и хоткеи
+  document.querySelectorAll('.action-btn').forEach(btn => {
+    btn.addEventListener('click', e => { e.preventDefault(); handleAction(btn.dataset.action); });
+  });
+
   canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
-    ruler.mouse.x = e.clientX - rect.left;
-    ruler.mouse.y = e.clientY - rect.top;
+    const w = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    ruler.mouse.x = w.x; ruler.mouse.y = w.y;
     ruler.mouse.inside = true;
   });
   canvas.addEventListener('mouseleave', () => { ruler.mouse.inside = false; });
   canvas.addEventListener('click', e => {
     const rect = canvas.getBoundingClientRect();
-    const p = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const p = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
     if (!ruler.pending) ruler.pending = p;
     else { ruler.segments.push({ a: ruler.pending, b: p }); ruler.pending = null; }
+  });
+
+  // Zoom по колёсику мыши — якорный, с привязкой к точке под курсором,
+  // чтобы эта точка мира оставалась под курсором при изменении масштаба.
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const rect = canvas.getBoundingClientRect();
+    const sx = e.clientX - rect.left;
+    const sy = e.clientY - rect.top;
+    const oldZoom = view.zoom;
+    const factor  = Math.exp(-e.deltaY * 0.0015); // плавная экспонента
+    const newZoom = Math.min(6, Math.max(0.2, oldZoom * factor));
+    view.offsetX = sx - (sx - view.offsetX) * (newZoom / oldZoom);
+    view.offsetY = sy - (sy - view.offsetY) * (newZoom / oldZoom);
+    view.zoom = newZoom;
+  }, { passive: false });
+
+  // Pinch-zoom на мобиле: две точки touch — якорим мировую точку под
+  // серединой между пальцами. Попутно получается «свободный» pan, если
+  // середина пальцев смещается.
+  const pointers = new Map();
+  let pinchState = null;
+  canvas.addEventListener('pointerdown', e => {
+    if (e.pointerType !== 'touch') return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 2) {
+      const pts = [...pointers.values()];
+      const rect = canvas.getBoundingClientRect();
+      const midX = (pts[0].x + pts[1].x) / 2 - rect.left;
+      const midY = (pts[0].y + pts[1].y) / 2 - rect.top;
+      pinchState = {
+        startDist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+        startZoom: view.zoom,
+        worldX: (midX - view.offsetX) / view.zoom,
+        worldY: (midY - view.offsetY) / view.zoom
+      };
+      // если юзер уже тапнул первую точку рулетки — отменим её,
+      // чтобы pinch не считался «вторым кликом»
+      ruler.pending = null;
+    }
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (e.pointerType !== 'touch') return;
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pinchState && pointers.size === 2) {
+      const pts = [...pointers.values()];
+      const rect = canvas.getBoundingClientRect();
+      const midX = (pts[0].x + pts[1].x) / 2 - rect.left;
+      const midY = (pts[0].y + pts[1].y) / 2 - rect.top;
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      let newZoom = pinchState.startZoom * (dist / pinchState.startDist);
+      newZoom = Math.min(6, Math.max(0.2, newZoom));
+      view.zoom    = newZoom;
+      // держим мировую точку, зафиксированную в момент начала pinch,
+      // под текущим центром между пальцами
+      view.offsetX = midX - pinchState.worldX * newZoom;
+      view.offsetY = midY - pinchState.worldY * newZoom;
+    }
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(type => {
+    canvas.addEventListener(type, e => {
+      if (pointers.has(e.pointerId)) pointers.delete(e.pointerId);
+      if (pointers.size < 2) pinchState = null;
+    });
   });
 
   // ---------- Геометрия колёс ----------
@@ -372,25 +523,26 @@ Esc — убрать все рулетки</div>
   }
 
   function drawScaleBar() {
-    // размещается под HUD-блоком слева сверху
+    // размещается под HUD-блоком слева сверху; длина отрезка реагирует на zoom
     const x = 22;
     const y = 180;
     const tick = 5;
+    const barLen = PPM * view.zoom;
     ctx.save();
     ctx.strokeStyle = '#222';
     ctx.fillStyle = '#222';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(x,       y);
-    ctx.lineTo(x + PPM, y);
-    ctx.moveTo(x,       y - tick);
-    ctx.lineTo(x,       y + tick);
-    ctx.moveTo(x + PPM, y - tick);
-    ctx.lineTo(x + PPM, y + tick);
+    ctx.moveTo(x,          y);
+    ctx.lineTo(x + barLen, y);
+    ctx.moveTo(x,          y - tick);
+    ctx.lineTo(x,          y + tick);
+    ctx.moveTo(x + barLen, y - tick);
+    ctx.lineTo(x + barLen, y + tick);
     ctx.stroke();
     ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     ctx.textBaseline = 'middle';
-    ctx.fillText('1 м', x + PPM + 8, y);
+    ctx.fillText('1 м', x + barLen + 8, y);
     ctx.restore();
   }
 
@@ -398,11 +550,12 @@ Esc — убрать все рулетки</div>
     const dx = b.x - a.x, dy = b.y - a.y;
     const dist = Math.hypot(dx, dy);
     const meters = (dist / PPM).toFixed(2);
+    const invZ = 1 / view.zoom;
 
     ctx.save();
     ctx.strokeStyle = '#c24a2e';
     ctx.fillStyle   = '#c24a2e';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.5 * invZ;
 
     // линия
     ctx.beginPath();
@@ -410,24 +563,24 @@ Esc — убрать все рулетки</div>
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
 
-    // точки (диаметр 5 px)
+    // точки (диаметр 5 px на экране — при любом zoom)
     ctx.beginPath();
-    ctx.arc(a.x, a.y, 2.5, 0, Math.PI * 2);
+    ctx.arc(a.x, a.y, 2.5 * invZ, 0, Math.PI * 2);
     ctx.fill();
     ctx.beginPath();
-    ctx.arc(b.x, b.y, 2.5, 0, Math.PI * 2);
+    ctx.arc(b.x, b.y, 2.5 * invZ, 0, Math.PI * 2);
     ctx.fill();
 
     // подпись — по центру, со смещением перпендикулярно линии
     const len = Math.max(1, dist);
     const nx = -dy / len, ny = dx / len;
-    const lx = (a.x + b.x) / 2 + nx * 12;
-    const ly = (a.y + b.y) / 2 + ny * 12;
+    const lx = (a.x + b.x) / 2 + nx * 12 * invZ;
+    const ly = (a.y + b.y) / 2 + ny * 12 * invZ;
     const text = `${meters} м`;
-    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.font = (12 * invZ) + 'px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     ctx.textBaseline = 'middle';
     ctx.textAlign    = 'center';
-    ctx.lineWidth    = 3;
+    ctx.lineWidth    = 3 * invZ;
     ctx.strokeStyle  = '#f2efe9';
     ctx.strokeText(text, lx, ly);
     ctx.fillStyle    = '#2a2a2a';
@@ -443,10 +596,11 @@ Esc — убрать все рулетки</div>
       drawRulerSegment(ruler.pending, ruler.mouse);
     } else if (ruler.pending) {
       // мышь ушла — просто зафиксированная первая точка
+      const invZ = 1 / view.zoom;
       ctx.save();
       ctx.fillStyle = '#c24a2e';
       ctx.beginPath();
-      ctx.arc(ruler.pending.x, ruler.pending.y, 2.5, 0, Math.PI * 2);
+      ctx.arc(ruler.pending.x, ruler.pending.y, 2.5 * invZ, 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
@@ -496,10 +650,11 @@ Esc — убрать все рулетки</div>
     const dFL = Math.hypot(wp.FL.x - icr.x, wp.FL.y - icr.y);
     const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
     const R = Math.max(dFL, dFR);
+    const invZ = 1 / view.zoom;
     ctx.save();
     ctx.strokeStyle = 'rgba(50,100,170,0.45)';
-    ctx.setLineDash([6, 6]);
-    ctx.lineWidth = 1;
+    ctx.setLineDash([6 * invZ, 6 * invZ]);
+    ctx.lineWidth = 1 * invZ;
     ctx.beginPath();
     ctx.arc(icr.x, icr.y, R, 0, Math.PI * 2);
     ctx.stroke();
@@ -514,11 +669,12 @@ Esc — убрать все рулетки</div>
     const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
     const outer = dFL > dFR ? wp.FL : wp.FR;
     const R = Math.max(dFL, dFR);
+    const invZ = 1 / view.zoom;
 
     ctx.save();
     // Линия радиуса — от ICR до внешнего переднего колеса
     ctx.strokeStyle = 'rgba(50,100,170,0.95)';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1.5 * invZ;
     ctx.beginPath();
     ctx.moveTo(icr.x, icr.y);
     ctx.lineTo(outer.x, outer.y);
@@ -527,25 +683,25 @@ Esc — убрать все рулетки</div>
     // Точка ICR
     ctx.fillStyle = 'rgba(50,100,170,0.95)';
     ctx.beginPath();
-    ctx.arc(icr.x, icr.y, 3, 0, Math.PI * 2);
+    ctx.arc(icr.x, icr.y, 3 * invZ, 0, Math.PI * 2);
     ctx.fill();
-    ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.font = (11 * invZ) + 'px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     ctx.fillStyle = '#2a5a99';
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
-    ctx.fillText('ICR', icr.x + 6, icr.y + 4);
+    ctx.fillText('ICR', icr.x + 6 * invZ, icr.y + 4 * invZ);
 
     // Подпись радиуса — посередине линии, со смещением перпендикулярно
     const dx = outer.x - icr.x, dy = outer.y - icr.y;
     const len = Math.max(1, Math.hypot(dx, dy));
     const nx = -dy / len, ny = dx / len;
-    const mx = (icr.x + outer.x) / 2 + nx * 12;
-    const my = (icr.y + outer.y) / 2 + ny * 12;
+    const mx = (icr.x + outer.x) / 2 + nx * 12 * invZ;
+    const my = (icr.y + outer.y) / 2 + ny * 12 * invZ;
     const text = `R = ${(R / PPM).toFixed(2)} м`;
-    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.font = (12 * invZ) + 'px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
     ctx.textBaseline = 'middle';
     ctx.textAlign    = 'center';
-    ctx.lineWidth    = 3;
+    ctx.lineWidth    = 3 * invZ;
     ctx.strokeStyle  = '#f2efe9';
     ctx.strokeText(text, mx, my);
     ctx.fillStyle    = '#2a5a99';
@@ -575,12 +731,16 @@ Esc — убрать все рулетки</div>
   function render() {
     ctx.fillStyle = '#f2efe9';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(view.offsetX, view.offsetY);
+    ctx.scale(view.zoom, view.zoom);
     drawTracks();
     drawTurnCircleBack();   // пунктирная окружность — под машиной
     drawCar();
     drawTurnCircleFront();  // линия радиуса + ICR + подпись — поверх машины
     drawRulers();
-    drawScaleBar();
+    ctx.restore();
+    drawScaleBar();          // экранные координаты — не масштабируется
     updateAnglesHud();
   }
 
