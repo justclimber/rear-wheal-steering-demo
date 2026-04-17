@@ -1,0 +1,4 @@
+# Игнорируем всё, кроме demo.html и самого .gitignore
+*
+!demo.html
+!.gitignore
