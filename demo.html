@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Wheels — PoC</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #f2efe9; }
+  canvas { display: block; }
+  .hud-box {
+    position: fixed;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #333; background: rgba(255,255,255,0.7);
+    padding: 8px 12px; border-radius: 6px; pointer-events: none;
+    white-space: pre;
+  }
+  #hud       { top:  10px; left:  12px; }
+  #anglesHud { bottom: 12px; left: 12px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud" class="hud-box">Стрелки: ← → — поворот колёс, ↑ ↓ — вперёд / назад
+R — сброс положения машины
+H — очистить следы
+C — показ/скрытие предполагаемой окружности разворота (ICR)
+W — режим задней оси: <span id="rearMode">прямо</span>
+Клик мышью — рулетка (2 точки)
+Esc — убрать все рулетки</div>
+<div id="anglesHud" class="hud-box">Углы поворота колес: передние 0°, задние 0°
+Радиус разворота: — (едет прямо)</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Масштаб игрового пространства ----------
+  // PPM = pixels per meter. Подобран так, чтобы визуальный размер машины
+  // остался примерно прежним (~+17% от исходных 120 px по длине кузова).
+  const PPM = 28;
+
+  // Реальные размеры референсной машины (в метрах) — крупный кроссовер
+  const REAL = {
+    length:    5.240, // общая длина кузова
+    width:     1.999, // ширина кузова
+    wheelbase: 3.160, // колёсная база
+    trackF:    1.722, // передняя колея
+    trackR:    1.724, // задняя колея
+    wheelDia:  0.78,  // диаметр колеса (с шиной), оценочно
+    wheelWid:  0.255  // ширина шины, оценочно
+  };
+
+  // ---------- Параметры машины (в пикселях — выводятся из REAL и PPM) ----------
+  const CAR = {
+    length:   REAL.wheelbase * PPM,                 // колёсная база
+    bodyLen:  REAL.length    * PPM,                 // длина кузова
+    bodyWid:  REAL.width     * PPM,                 // ширина кузова
+    trackW:   ((REAL.trackF + REAL.trackR) / 2) * PPM, // средняя колея
+    wheelLen: REAL.wheelDia  * PPM,
+    wheelWid: REAL.wheelWid  * PPM,
+    speed: 130,              // пикселей в секунду — постоянная небольшая скорость
+    steerSpeed: Math.PI,     // как быстро колёса поворачиваются
+    steerReturn: Math.PI*0.7 // как быстро возвращаются к нулю, когда клавиши отпущены
+  };
+
+  // Режимы задней оси. Для каждого:
+  //   maxFrontDeg — ограничение поворота передних колёс в градусах
+  //   rearFactor  — коэффициент deltaR от deltaF (со знаком)
+  //
+  // Угол 35.6° подобран так, чтобы curb-to-curb радиус в фиксированном
+  // режиме совпал с референсным значением 6.15 м при L=3.16 м и колее
+  // ≈ 1.72 м. Формула: R = √(L² + (L/tan(δ_f) + track/2)²) = 6.15
+  // даёт δ_f ≈ 35.6°. С подруливанием 10° получается ≈ 5.08 м (референс 4.98 м);
+  // в чисто кинематической bicycle-модели одновременно в обе цифры не
+  // попасть — разница идёт от Ackermann-дифференциала реальной машины.
+  const REAR_MODES = [
+    { key: 'fixed',   label: 'прямо',        maxFrontDeg: 35.6, rearFactor:  0        },
+    { key: 'counter', label: 'подруливание', maxFrontDeg: 35.6, rearFactor: -10/35.6  }, // при deltaF=35.6° → deltaR=-10°
+    { key: 'crab',    label: 'краб',         maxFrontDeg: 10,   rearFactor:  1        }  // deltaF=deltaR, оба до 10°
+  ];
+
+  // ---------- Состояние ----------
+  // Используем кинематическую модель "велосипеда": две оси (передняя/задняя),
+  // каждая может иметь свой угол поворота колёс — это позволит в след. фазе
+  // включить подруливание задних колёс без изменения архитектуры.
+  let state = {
+    x: 0, y: 0, heading: 0,
+    deltaF: 0, deltaR: 0,
+    rearMode: 0,         // индекс в REAR_MODES: 0=fixed, 1=counter, 2=crab
+    dir: 0,
+    // следы 4-х колёс: FL, FR, RL, RR; каждый след — массив сегментов-полилиний,
+    // чтобы после телепортации (сброса) старые и новые точки не соединялись
+    tracks: [[[]], [[]], [[]], [[]]],
+    // цвет для каждого сегмента (один цвет на "заезд" — общий для всех 4 колёс)
+    trackColors: []
+  };
+  // Генератор «грязного» цвета: низкая насыщенность, средняя яркость,
+  // случайный hue — визуально похоже на примесь серого к любому цвету.
+  function dirtyColor() {
+    const hue = Math.random() * 360;
+    const sat = 15 + Math.random() * 25; // 15–40%
+    const lig = 28 + Math.random() * 18; // 28–46%
+    return `hsla(${hue.toFixed(0)}, ${sat.toFixed(0)}%, ${lig.toFixed(0)}%, 0.5)`;
+  }
+  state.trackColors.push(dirtyColor());
+  // Сбрасывает только положение / ориентацию / углы колёс.
+  // Следы шин и режим задней оси сохраняются, но начинается новый сегмент,
+  // чтобы старый след не соединялся с новой траекторией.
+  function reset() {
+    state.x = canvas.width / 2;
+    state.y = canvas.height / 2;
+    state.heading = -Math.PI / 2; // по умолчанию — вверх
+    state.deltaF = 0;
+    state.deltaR = 0;
+    state.dir = 0;
+    for (let i = 0; i < 4; i++) state.tracks[i].push([]);
+    state.trackColors.push(dirtyColor());
+  }
+  reset();
+  function updateRearModeHud() {
+    const el = document.getElementById('rearMode');
+    if (el) el.textContent = REAR_MODES[state.rearMode].label;
+  }
+  updateRearModeHud();
+
+  // ---------- Ввод ----------
+  const keys = Object.create(null);
+  // Рулетка
+  const ruler = {
+    segments: [],   // зафиксированные: [{a:{x,y}, b:{x,y}}, ...]
+    pending: null,  // первая точка текущего измерения (до второго клика)
+    mouse: { x: 0, y: 0, inside: false }
+  };
+  window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (e.code === 'KeyR') reset();
+    if (e.code === 'KeyH') {
+      state.tracks = [[[]], [[]], [[]], [[]]];
+      state.trackColors = [dirtyColor()];
+    }
+    if (e.code === 'KeyW') {
+      state.rearMode = (state.rearMode + 1) % REAR_MODES.length;
+      updateRearModeHud();
+    }
+    if (e.code === 'KeyC') showTurnCircle = !showTurnCircle;
+    if (e.code === 'Escape') {
+      if (ruler.pending) ruler.pending = null;
+      else ruler.segments = [];
+    }
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    ruler.mouse.x = e.clientX - rect.left;
+    ruler.mouse.y = e.clientY - rect.top;
+    ruler.mouse.inside = true;
+  });
+  canvas.addEventListener('mouseleave', () => { ruler.mouse.inside = false; });
+  canvas.addEventListener('click', e => {
+    const rect = canvas.getBoundingClientRect();
+    const p = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    if (!ruler.pending) ruler.pending = p;
+    else { ruler.segments.push({ a: ruler.pending, b: p }); ruler.pending = null; }
+  });
+
+  // ---------- Геометрия колёс ----------
+  // Возвращает позиции 4-х колёс в мировых координатах + их ориентацию.
+  function wheelPositions(s) {
+    const cos = Math.cos(s.heading), sin = Math.sin(s.heading);
+    // оси вдоль машины: forward = (cos, sin), left = (-sin, cos)
+    const halfL = CAR.length / 2;
+    const halfT = CAR.trackW / 2;
+
+    // центры передней и задней осей
+    const fx = s.x + cos * halfL;
+    const fy = s.y + sin * halfL;
+    const rx = s.x - cos * halfL;
+    const ry = s.y - sin * halfL;
+
+    // смещения влево/вправо
+    const lx = -sin * halfT, ly = cos * halfT;
+
+    return {
+      FL: { x: fx + lx, y: fy + ly, angle: s.heading + s.deltaF },
+      FR: { x: fx - lx, y: fy - ly, angle: s.heading + s.deltaF },
+      RL: { x: rx + lx, y: ry + ly, angle: s.heading + s.deltaR },
+      RR: { x: rx - lx, y: ry - ly, angle: s.heading + s.deltaR },
+      front: { x: fx, y: fy },
+      rear:  { x: rx, y: ry }
+    };
+  }
+
+  // ---------- Физика ----------
+  // Кинематика с возможным рулением и задними колёсами.
+  // Передняя ось движется со скоростью v в направлении (heading + deltaF),
+  // задняя — в направлении (heading + deltaR).
+  // После шага восстанавливаем жёсткое расстояние между осями = CAR.length
+  // и обновляем heading как угол от задней оси к передней.
+  function step(dt) {
+    const s = state;
+
+    // 1. Управление рулём. Предел передних колёс зависит от режима задней оси.
+    const mode = REAR_MODES[s.rearMode];
+    const maxFront = mode.maxFrontDeg * Math.PI / 180;
+    let steerTarget = 0;
+    if (keys['ArrowLeft'])  steerTarget -= 1;
+    if (keys['ArrowRight']) steerTarget += 1;
+    if (steerTarget !== 0) {
+      s.deltaF += steerTarget * CAR.steerSpeed * dt;
+    }
+    // автовозврат руля к нулю отключён — колёса остаются в последнем положении
+    if (s.deltaF >  maxFront) s.deltaF =  maxFront;
+    if (s.deltaF < -maxFront) s.deltaF = -maxFront;
+
+    // 1b. Задние колёса — производная от deltaF и режима (rearFactor содержит знак).
+    s.deltaR = s.deltaF * mode.rearFactor;
+
+    // 2. Направление движения
+    s.dir = 0;
+    if (keys['ArrowUp'])   s.dir += 1;
+    if (keys['ArrowDown']) s.dir -= 1;
+    if (s.dir === 0) return;
+
+    // 3. Точное интегрирование на шаге dt: либо прямое движение (если колёса
+    // параллельны), либо поворот всей машины вокруг мгновенного центра
+    // вращения (ICR). Так гарантируется идеально круговая траектория при
+    // постоянных углах колёс — без дрейфа радиуса.
+    const L  = CAR.length;
+    const v  = CAR.speed * s.dir * dt;   // знаковое перемещение задней оси за шаг
+    const dr = s.deltaR, df = s.deltaF;
+    const denom = Math.cos(dr) * Math.tan(df) - Math.sin(dr);
+
+    if (!isFinite(denom) || Math.abs(denom) < 1e-6) {
+      // Прямо / краб: всё тело сносится в одну сторону без поворота heading.
+      // В режиме «краб» оба угла равны — поэтому направление = heading + δ_r.
+      const slipDir = s.heading + dr;
+      s.x += v * Math.cos(slipDir);
+      s.y += v * Math.sin(slipDir);
+    } else {
+      // Поворот вокруг ICR. Угловое перемещение: dθ = v_rear * denom / L.
+      // v_rear здесь = CAR.speed·dir (скорость задней оси по её колёсному
+      // направлению), поэтому v·denom/L — уже dθ.
+      const dTheta = v * denom / L;
+
+      // ICR в мировых координатах (та же формула, что в computeICR)
+      const t   = L / denom;
+      const lx  = -t * Math.sin(dr);
+      const ly  =  t * Math.cos(dr);
+      const ch0 = Math.cos(s.heading), sh0 = Math.sin(s.heading);
+      const rxW = s.x - ch0 * L / 2;
+      const ryW = s.y - sh0 * L / 2;
+      const icrX = rxW + lx * ch0 + ly * (-sh0);
+      const icrY = ryW + lx * sh0 + ly *   ch0;
+
+      // Поворачиваем центр машины вокруг ICR на dTheta
+      const dx = s.x - icrX, dy = s.y - icrY;
+      const c = Math.cos(dTheta), si = Math.sin(dTheta);
+      s.x = icrX + c * dx - si * dy;
+      s.y = icrY + si * dx + c * dy;
+      s.heading += dTheta;
+    }
+
+    // 5. Запись следов колёс — в последний (текущий) сегмент каждого колеса
+    const wp = wheelPositions(s);
+    const keysArr = ['FL','FR','RL','RR'];
+    for (let i = 0; i < 4; i++) {
+      const segs = s.tracks[i];
+      const seg  = segs[segs.length - 1];
+      const w = wp[keysArr[i]];
+      seg.push([w.x, w.y]);
+      // ограничиваем длину текущего сегмента, чтобы не съедать память
+      if (seg.length > 4000) seg.splice(0, seg.length - 4000);
+    }
+  }
+
+  // ---------- Рендер ----------
+  function drawTracks() {
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 4; i++) {
+      const segs = state.tracks[i];
+      for (let k = 0; k < segs.length; k++) {
+        const arr = segs[k];
+        if (arr.length < 2) continue;
+        ctx.strokeStyle = state.trackColors[k] || 'rgba(60,50,40,0.35)';
+        ctx.beginPath();
+        ctx.moveTo(arr[0][0], arr[0][1]);
+        for (let j = 1; j < arr.length; j++) ctx.lineTo(arr[j][0], arr[j][1]);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawWheel(w) {
+    ctx.save();
+    ctx.translate(w.x, w.y);
+    ctx.rotate(w.angle);
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-CAR.wheelLen/2, -CAR.wheelWid/2, CAR.wheelLen, CAR.wheelWid);
+    ctx.restore();
+  }
+
+  function drawCar() {
+    const s = state;
+    const wp = wheelPositions(s);
+
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.heading);
+
+    const L = CAR.bodyLen;
+    const W = CAR.bodyWid;
+    const halfL = L / 2;
+    const halfW = W / 2;
+
+    // --- Кузов: скруглённый прямоугольник ---
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#2a2a2a';
+    ctx.fillStyle   = '#dcd6c8';
+    ctx.beginPath();
+    ctx.roundRect(-halfL, -halfW, L, W, 14);
+    ctx.fill();
+    ctx.stroke();
+
+    // --- Боковые зеркала (самое широкое место) ---
+    const mirrorX = halfL * 0.22; // ближе к передней стойке
+    ctx.fillStyle = '#2a2a2a';
+    ctx.beginPath();
+    ctx.roundRect(mirrorX - 4, -halfW - 4, 8, 5, 2);
+    ctx.roundRect(mirrorX - 4,  halfW - 1, 8, 5, 2);
+    ctx.fill();
+
+    // --- Кабина (salon): внутренний скруглённый прямоугольник ---
+    const cabinFront = halfL * 0.48;
+    const cabinRear  = -halfL * 0.68;
+    const cabinW     = W - 14;
+    ctx.fillStyle   = '#b9b2a2';
+    ctx.strokeStyle = '#3a3a3a';
+    ctx.lineWidth   = 1.2;
+    ctx.beginPath();
+    ctx.roundRect(cabinRear, -cabinW / 2, cabinFront - cabinRear, cabinW, 10);
+    ctx.fill();
+    ctx.stroke();
+
+    // --- Фары ---
+    ctx.fillStyle = '#f1e5a4';
+    ctx.beginPath();
+    ctx.roundRect(halfL - 6, -halfW + 5, 4, 9, 1.5);
+    ctx.roundRect(halfL - 6,  halfW - 14, 4, 9, 1.5);
+    ctx.fill();
+
+    // --- Задние фонари ---
+    ctx.fillStyle = '#a83232';
+    ctx.beginPath();
+    ctx.roundRect(-halfL + 2, -halfW + 5, 4, 8, 1.5);
+    ctx.roundRect(-halfL + 2,  halfW - 13, 4, 8, 1.5);
+    ctx.fill();
+
+    ctx.restore();
+
+    drawWheel(wp.FL);
+    drawWheel(wp.FR);
+    drawWheel(wp.RL);
+    drawWheel(wp.RR);
+  }
+
+  function drawScaleBar() {
+    // размещается под HUD-блоком слева сверху
+    const x = 22;
+    const y = 180;
+    const tick = 5;
+    ctx.save();
+    ctx.strokeStyle = '#222';
+    ctx.fillStyle = '#222';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x,       y);
+    ctx.lineTo(x + PPM, y);
+    ctx.moveTo(x,       y - tick);
+    ctx.lineTo(x,       y + tick);
+    ctx.moveTo(x + PPM, y - tick);
+    ctx.lineTo(x + PPM, y + tick);
+    ctx.stroke();
+    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('1 м', x + PPM + 8, y);
+    ctx.restore();
+  }
+
+  function drawRulerSegment(a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy);
+    const meters = (dist / PPM).toFixed(2);
+
+    ctx.save();
+    ctx.strokeStyle = '#c24a2e';
+    ctx.fillStyle   = '#c24a2e';
+    ctx.lineWidth = 1.5;
+
+    // линия
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+
+    // точки (диаметр 5 px)
+    ctx.beginPath();
+    ctx.arc(a.x, a.y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // подпись — по центру, со смещением перпендикулярно линии
+    const len = Math.max(1, dist);
+    const nx = -dy / len, ny = dx / len;
+    const lx = (a.x + b.x) / 2 + nx * 12;
+    const ly = (a.y + b.y) / 2 + ny * 12;
+    const text = `${meters} м`;
+    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign    = 'center';
+    ctx.lineWidth    = 3;
+    ctx.strokeStyle  = '#f2efe9';
+    ctx.strokeText(text, lx, ly);
+    ctx.fillStyle    = '#2a2a2a';
+    ctx.fillText(text, lx, ly);
+    ctx.restore();
+  }
+
+  function drawRulers() {
+    // зафиксированные измерения
+    for (const seg of ruler.segments) drawRulerSegment(seg.a, seg.b);
+    // текущее — от первой точки до курсора
+    if (ruler.pending && ruler.mouse.inside) {
+      drawRulerSegment(ruler.pending, ruler.mouse);
+    } else if (ruler.pending) {
+      // мышь ушла — просто зафиксированная первая точка
+      ctx.save();
+      ctx.fillStyle = '#c24a2e';
+      ctx.beginPath();
+      ctx.arc(ruler.pending.x, ruler.pending.y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // Флаг показа окружности разворота в игровом пространстве (в HUD всегда видно)
+  let showTurnCircle = true;
+
+  // ---------- Мгновенный центр вращения (ICR) и радиус разворота ----------
+  // Возвращает мировые координаты ICR и признак валидности, либо null,
+  // если колёса параллельны (едет прямо или «крабом»).
+  function computeICR(s) {
+    const df = s.deltaF, dr = s.deltaR;
+    const denom = Math.cos(dr) * Math.tan(df) - Math.sin(dr);
+    if (!isFinite(denom) || Math.abs(denom) < 1e-4) return null;
+    const L = CAR.length;
+    const t = L / denom;
+    // Локальные координаты ICR (относительно задней оси, +x — вперёд, +y — влево)
+    const lx = -t * Math.sin(dr);
+    const ly =  t * Math.cos(dr);
+    // Положение задней оси в мировых координатах
+    const ch = Math.cos(s.heading), sh = Math.sin(s.heading);
+    const rx = s.x - ch * L / 2;
+    const ry = s.y - sh * L / 2;
+    // Преобразование локальных (lx, ly) в мировые: поворот на heading
+    // Локальный X-орт = (ch, sh), локальный Y-орт = (-sh, ch)
+    const wx = rx + lx * ch + ly * (-sh);
+    const wy = ry + lx * sh + ly *   ch;
+    return { x: wx, y: wy };
+  }
+  // Радиус curb-to-curb: расстояние от ICR до самого внешнего переднего колеса.
+  function curbRadius(s, icr) {
+    const wp = wheelPositions(s);
+    const dFL = Math.hypot(wp.FL.x - icr.x, wp.FL.y - icr.y);
+    const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
+    return Math.max(dFL, dFR);
+  }
+  // Окружность разворота рисуется в два прохода:
+  //   drawTurnCircleBack  — пунктирная окружность (под машиной)
+  //   drawTurnCircleFront — линия радиуса, точка ICR и подписи (поверх машины,
+  //                         чтобы видеть, к какому именно колесу крепится радиус)
+  function drawTurnCircleBack() {
+    if (!showTurnCircle) return;
+    const icr = computeICR(state);
+    if (!icr) return;
+    const wp = wheelPositions(state);
+    const dFL = Math.hypot(wp.FL.x - icr.x, wp.FL.y - icr.y);
+    const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
+    const R = Math.max(dFL, dFR);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(50,100,170,0.45)';
+    ctx.setLineDash([6, 6]);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(icr.x, icr.y, R, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+  function drawTurnCircleFront() {
+    if (!showTurnCircle) return;
+    const icr = computeICR(state);
+    if (!icr) return;
+    const wp = wheelPositions(state);
+    const dFL = Math.hypot(wp.FL.x - icr.x, wp.FL.y - icr.y);
+    const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
+    const outer = dFL > dFR ? wp.FL : wp.FR;
+    const R = Math.max(dFL, dFR);
+
+    ctx.save();
+    // Линия радиуса — от ICR до внешнего переднего колеса
+    ctx.strokeStyle = 'rgba(50,100,170,0.95)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(icr.x, icr.y);
+    ctx.lineTo(outer.x, outer.y);
+    ctx.stroke();
+
+    // Точка ICR
+    ctx.fillStyle = 'rgba(50,100,170,0.95)';
+    ctx.beginPath();
+    ctx.arc(icr.x, icr.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.fillStyle = '#2a5a99';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillText('ICR', icr.x + 6, icr.y + 4);
+
+    // Подпись радиуса — посередине линии, со смещением перпендикулярно
+    const dx = outer.x - icr.x, dy = outer.y - icr.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    const nx = -dy / len, ny = dx / len;
+    const mx = (icr.x + outer.x) / 2 + nx * 12;
+    const my = (icr.y + outer.y) / 2 + ny * 12;
+    const text = `R = ${(R / PPM).toFixed(2)} м`;
+    ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign    = 'center';
+    ctx.lineWidth    = 3;
+    ctx.strokeStyle  = '#f2efe9';
+    ctx.strokeText(text, mx, my);
+    ctx.fillStyle    = '#2a5a99';
+    ctx.fillText(text, mx, my);
+    ctx.restore();
+  }
+
+  const anglesEl = document.getElementById('anglesHud');
+  function updateAnglesHud() {
+    const fDeg = Math.round(state.deltaF * 180 / Math.PI);
+    const rDeg = Math.round(state.deltaR * 180 / Math.PI);
+    const line1 = `Углы поворота колес: передние ${fDeg}°, задние ${rDeg}°`;
+    const icr = computeICR(state);
+    let line2;
+    if (!icr) {
+      const mode = REAR_MODES[state.rearMode];
+      line2 = (mode.key === 'crab' && state.deltaF !== 0)
+        ? 'Радиус разворота: ∞ (крабовый снос)'
+        : 'Радиус разворота: — (едет прямо)';
+    } else {
+      const R = curbRadius(state, icr) / PPM;
+      line2 = `Радиус разворота (по внешнему переднему колесу): ${R.toFixed(2)} м`;
+    }
+    anglesEl.textContent = `${line1}\n${line2}`;
+  }
+
+  function render() {
+    ctx.fillStyle = '#f2efe9';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawTracks();
+    drawTurnCircleBack();   // пунктирная окружность — под машиной
+    drawCar();
+    drawTurnCircleFront();  // линия радиуса + ICR + подпись — поверх машины
+    drawRulers();
+    drawScaleBar();
+    updateAnglesHud();
+  }
+
+  // ---------- Цикл ----------
+  let last = performance.now();
+  function loop(now) {
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05; // защита от больших скачков
+    step(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
