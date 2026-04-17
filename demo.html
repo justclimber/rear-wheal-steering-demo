@@ -23,6 +23,23 @@
   body.mobile #hud { display: none; }
   body.mobile #anglesHud { top: 10px; bottom: auto; left: 10px; right: 10px; font-size: 12px; }
   body.mobile #mobileControls { display: block; }
+  body.mobile #envPanel     { display: none; } /* окружения — только на десктопе */
+
+  #envPanel {
+    position: fixed; top: 10px; right: 12px;
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #333; background: rgba(255,255,255,0.7);
+    padding: 8px 12px; border-radius: 6px;
+  }
+  #envPanel .title { color: #666; margin-bottom: 4px; }
+  #envPanel button {
+    display: block; width: 100%; margin-top: 4px; padding: 5px 8px;
+    font: inherit; text-align: left;
+    background: rgba(255,255,255,0.6); border: 1px solid #bbb; border-radius: 4px;
+    cursor: pointer;
+  }
+  #envPanel button:hover  { background: rgba(255,255,255,0.95); }
+  #envPanel button.active { background: #2a5a99; color: #fff; border-color: #2a5a99; }
 
   #mobileControls { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
   #dpad {
@@ -66,6 +83,13 @@ W — режим задней оси: <span id="rearMode">прямо</span>
 Esc — убрать все рулетки</div>
 <div id="anglesHud" class="hud-box">Углы поворота колес: передние 0°, задние 0°
 Радиус разворота: — (едет прямо)</div>
+<div id="envPanel">
+  <div class="title">Окружение:</div>
+  <button data-env="empty">Пустое пространство</button>
+  <button data-env="parking">Парковка</button>
+  <button data-env="road4">Разворот на 4-полосной</button>
+  <button data-env="road2">Разворот на 2-полосной</button>
+</div>
 <div id="mobileControls">
   <div id="dpad">
     <button class="dpad-btn dpad-up"    data-key="ArrowUp">▲</button>
@@ -153,27 +177,50 @@ Esc — убрать все рулетки</div>
     // цвет для каждого сегмента (один цвет на "заезд" — общий для всех 4 колёс)
     trackColors: []
   };
-  // Генератор «грязного» цвета: низкая насыщенность, средняя яркость,
-  // случайный hue — визуально похоже на примесь серого к любому цвету.
+  // true, если сейчас активно «дорожное» окружение с тёмным фоном —
+  // тогда следы и ICR-визуализация подсвечиваются светлыми цветами,
+  // чтобы читались на асфальте.
+  function onAsphalt() {
+    return env && (env.key === 'road4' || env.key === 'road2' || env.key === 'parking');
+  }
+  // Объявляем переменные окружения заранее — их читают onAsphalt() / reset().
+  // Сами ENVIRONMENTS и setEnvironment инициализируются ниже.
+  let env = { objects: [], start: null, key: 'empty' };
+  let collided = false;
+
+  // Генератор «грязного» цвета: низкая насыщенность, случайный hue.
+  // На асфальте — светлые пастельные оттенки, на светлом фоне — тёмные.
   function dirtyColor() {
     const hue = Math.random() * 360;
     const sat = 15 + Math.random() * 25; // 15–40%
-    const lig = 28 + Math.random() * 18; // 28–46%
+    if (onAsphalt()) {
+      const lig = 75 + Math.random() * 15; // 75–90%
+      return `hsla(${hue.toFixed(0)}, ${sat.toFixed(0)}%, ${lig.toFixed(0)}%, 0.65)`;
+    }
+    const lig = 28 + Math.random() * 18;   // 28–46%
     return `hsla(${hue.toFixed(0)}, ${sat.toFixed(0)}%, ${lig.toFixed(0)}%, 0.5)`;
   }
   state.trackColors.push(dirtyColor());
+
   // Сбрасывает только положение / ориентацию / углы колёс.
   // Следы шин и режим задней оси сохраняются, но начинается новый сегмент,
   // чтобы старый след не соединялся с новой траекторией.
   function reset() {
-    state.x = canvas.width / 2;
-    state.y = canvas.height / 2;
-    state.heading = -Math.PI / 2; // по умолчанию — вверх
+    if (env.start) {
+      state.x = env.start.x;
+      state.y = env.start.y;
+      state.heading = env.start.heading;
+    } else {
+      state.x = canvas.width / 2;
+      state.y = canvas.height / 2;
+      state.heading = -Math.PI / 2; // по умолчанию — вверх
+    }
     state.deltaF = 0;
     state.deltaR = 0;
     state.dir = 0;
     for (let i = 0; i < 4; i++) state.tracks[i].push([]);
     state.trackColors.push(dirtyColor());
+    collided = false;
   }
   reset();
   function updateRearModeHud() {
@@ -183,6 +230,394 @@ Esc — убрать все рулетки</div>
     if (btn) btn.textContent = 'Задние: ' + REAR_MODES[state.rearMode].label;
   }
   updateRearModeHud();
+
+  // ---------- Окружения ----------
+  // Каждое окружение возвращает:
+  //   start:   { x, y, heading } — где появляется машина
+  //   objects: [{ type, ... }]  — объекты для рендера и коллизий
+  // Типы объектов:
+  //   {type:'barrier', x,y,w,h, color} — прямоугольник с коллизией
+  //   {type:'line',    x1,y1,x2,y2, color, width, dash?} — только разметка,
+  //                                                         без коллизии
+  //   {type:'fill',    x,y,w,h, color} — фоновая заливка (асфальт), без коллизии
+  //
+  // Все координаты — мировые пиксели при PPM.
+  const ENVIRONMENTS = {
+    empty: {
+      label: 'Пустое пространство',
+      build() {
+        return { start: null, objects: [] }; // start=null → reset() сам отцентрует
+      }
+    },
+    parking: {
+      label: 'Парковка',
+      build() {
+        // Подземная парковка: горизонтальный проезд, два ряда мест,
+        // колонны между парами мест, одно свободное место в нижнем ряду.
+        // Все размеры — в метрах.
+        const spotW_m     = 3.25;   // ширина одного парковочного места
+        const spotD_m     = 5.4;    // глубина места
+        const colSz_m     = 0.5;    // сечение колонны
+        const corridorH_m = 6;      // высота проезда
+        const pairs       = 4;      // пар мест по горизонтали
+        const pairW_m     = 2 * spotW_m;                          // 6.5 м
+        const parkingW_m  = pairs * pairW_m + (pairs - 1) * colSz_m; // 27.5 м
+
+        const cx = canvas.width / 2;
+        const cy = canvas.height / 2;
+        const left = cx - parkingW_m / 2 * PPM;
+
+        const corridorTop = cy - corridorH_m / 2 * PPM;
+        const corridorBot = cy + corridorH_m / 2 * PPM;
+        const topSpotsY   = corridorTop - spotD_m * PPM;
+        const botSpotsY   = corridorBot;
+
+        // Seeded RNG (mulberry32) — стабильная расстановка припаркованных
+        // машин при каждой сборке окружения.
+        let seed = 1337;
+        function rnd() {
+          seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+          let t = seed;
+          t = Math.imul(t ^ (t >>> 15), t | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+        const randCarW = () => (1.5 + rnd() * 0.5) * PPM;
+        const randCarL = () => (3.3 + rnd() * 2.1) * PPM;
+
+        // X левого края парковочного места по индексу (0..2*pairs-1)
+        function spotX(i) {
+          const pair   = Math.floor(i / 2);
+          const inPair = i % 2;
+          return left + pair * (pairW_m + colSz_m) * PPM + inPair * spotW_m * PPM;
+        }
+
+        // Свободные места в нижнем ряду: 3-я пара, первый спот + самое левое.
+        const FREE_BOTTOM = new Set([0, 4]);
+        const TOTAL_SPOTS = pairs * 2;
+        // Соседи по ряду — делаем максимальных габаритов, чтобы заезд был
+        // визуально «затруднённым» даже на свободном месте.
+        const NEIGHBORS_BOTTOM = new Set();
+        for (const i of FREE_BOTTOM) {
+          if (i - 1 >= 0 && !FREE_BOTTOM.has(i - 1)) NEIGHBORS_BOTTOM.add(i - 1);
+          if (i + 1 < TOTAL_SPOTS && !FREE_BOTTOM.has(i + 1)) NEIGHBORS_BOTTOM.add(i + 1);
+        }
+        const MAX_CAR_W = 2.0 * PPM;
+        const MAX_CAR_L = 5.4 * PPM;
+
+        const objs = [];
+
+        // Фон парковки — тёмно-серый бетон
+        objs.push({ type: 'fill',
+          x: left - 2 * PPM, y: topSpotsY - 1 * PPM,
+          w: (parkingW_m + 4) * PPM, h: (corridorH_m + 2 * spotD_m + 2) * PPM,
+          color: '#4a4a4a' });
+
+        // Полоса проезда — чуть светлее (визуально отделим от мест)
+        objs.push({ type: 'fill',
+          x: left - 2 * PPM, y: corridorTop,
+          w: (parkingW_m + 4) * PPM, h: corridorH_m * PPM,
+          color: '#575757' });
+
+        // Разделители между парковочными местами
+        for (let p = 0; p < pairs; p++) {
+          const divX = left + p * (pairW_m + colSz_m) * PPM + spotW_m * PPM;
+          objs.push({ type: 'line',
+            x1: divX, y1: topSpotsY, x2: divX, y2: corridorTop,
+            color: '#ddd', width: 1.5 });
+          objs.push({ type: 'line',
+            x1: divX, y1: corridorBot, x2: divX, y2: corridorBot + spotD_m * PPM,
+            color: '#ddd', width: 1.5 });
+        }
+
+        // Собираем машины ряда в массив, чтобы потом вычислить границы стен
+        // (крайние точки по Y в верхнем и нижнем рядах).
+        const topCars = [];
+        const botCars = [];
+
+        // Верхний ряд: все места заняты
+        for (let i = 0; i < TOTAL_SPOTS; i++) {
+          const cw = randCarW(), cl = randCarL();
+          const sx = spotX(i);
+          const cxSpot = sx + spotW_m / 2 * PPM;
+          const cySpot = topSpotsY + spotD_m / 2 * PPM;
+          const x = cxSpot - cw / 2 + (rnd() - 0.5) * (spotW_m * PPM - cw) * 0.5;
+          const y = cySpot - cl / 2 + (rnd() - 0.5) * (spotD_m * PPM - cl) * 0.3;
+          topCars.push({ x, y, w: cw, h: cl });
+          objs.push({ type: 'barrier', x, y, w: cw, h: cl, color: '#a5a09a' });
+        }
+        // Нижний ряд: пустые места из FREE_BOTTOM, соседи свободных — максимальных
+        // габаритов и без случайного смещения, прижаты к центру места.
+        for (let i = 0; i < TOTAL_SPOTS; i++) {
+          if (FREE_BOTTOM.has(i)) continue;
+          const isNeighbor = NEIGHBORS_BOTTOM.has(i);
+          const cw = isNeighbor ? MAX_CAR_W : randCarW();
+          const cl = isNeighbor ? MAX_CAR_L : randCarL();
+          const sx = spotX(i);
+          const cxSpot = sx + spotW_m / 2 * PPM;
+          const cySpot = botSpotsY + spotD_m / 2 * PPM;
+          const jitterX = isNeighbor ? 0 : (rnd() - 0.5) * (spotW_m * PPM - cw) * 0.5;
+          const jitterY = isNeighbor ? 0 : (rnd() - 0.5) * (spotD_m * PPM - cl) * 0.3;
+          const x = cxSpot - cw / 2 + jitterX;
+          const y = cySpot - cl / 2 + jitterY;
+          botCars.push({ x, y, w: cw, h: cl });
+          objs.push({ type: 'barrier', x, y, w: cw, h: cl, color: '#a5a09a' });
+        }
+
+        // Стены по периметру (кроме правой стороны — там пустота).
+        // Верх: 0.2 м выше самой длинной машины верхнего ряда
+        //   (фактически — выше минимальной Y-координаты любой машины в ряду);
+        // низ: 0.2 м ниже самой длинной машины нижнего ряда
+        //   (ниже максимальной y+h);
+        // лево: 0.3 м левее гипотетической максимально широкой (2.0 м)
+        //   машины, стоящей по центру самого левого спота верхнего ряда.
+        const minTopY = Math.min(...topCars.map(c => c.y));
+        const maxBotY = Math.max(...botCars.map(c => c.y + c.h));
+        const wallTopY  = minTopY - 0.2 * PPM;
+        const wallBotY  = maxBotY + 0.2 * PPM;
+        const leftmostCenterX = spotX(0) + spotW_m / 2 * PPM;
+        const wallLeftX = leftmostCenterX - MAX_CAR_W / 2 - 0.3 * PPM;
+        const wallThick = 0.3 * PPM;
+        const wallRightX = left + parkingW_m * PPM + 2 * PPM;
+        // верхняя
+        objs.push({ type: 'barrier',
+          x: wallLeftX - wallThick, y: wallTopY - wallThick,
+          w: wallRightX - wallLeftX + wallThick,  h: wallThick,
+          color: '#3a3a3a' });
+        // нижняя
+        objs.push({ type: 'barrier',
+          x: wallLeftX - wallThick, y: wallBotY,
+          w: wallRightX - wallLeftX + wallThick,  h: wallThick,
+          color: '#3a3a3a' });
+        // левая
+        objs.push({ type: 'barrier',
+          x: wallLeftX - wallThick, y: wallTopY - wallThick,
+          w: wallThick, h: (wallBotY - wallTopY) + 2 * wallThick,
+          color: '#3a3a3a' });
+
+        // Колонны между парами: сверху примыкают к верхней границе проезда,
+        // снизу — к нижней. Это «ближе к проезду» по ТЗ.
+        for (let c = 0; c < pairs - 1; c++) {
+          const colX = left + c * (pairW_m + colSz_m) * PPM + pairW_m * PPM;
+          objs.push({ type: 'barrier',
+            x: colX, y: corridorTop - colSz_m * PPM,
+            w: colSz_m * PPM, h: colSz_m * PPM, color: '#3a3a3a' });
+          objs.push({ type: 'barrier',
+            x: colX, y: corridorBot,
+            w: colSz_m * PPM, h: colSz_m * PPM, color: '#3a3a3a' });
+        }
+
+        // Стартовая позиция: в коридоре, у правого конца, лицом влево.
+        const startX = left + parkingW_m * PPM - 2 * PPM;
+        return {
+          start: { x: startX, y: cy, heading: Math.PI },
+          objects: objs
+        };
+      }
+    },
+    road2: {
+      label: 'Разворот на 2-полосной',
+      build() {
+        // Параметры в метрах
+        const laneW_m   = 3.5;
+        const curbW_m   = 0.30;
+        const shoulder  = 0.20;
+        const roadLen_m = 200;
+        const L  = laneW_m * PPM;
+        const CW = curbW_m * PPM;
+        const SH = shoulder * PPM;
+        const roadLen = roadLen_m * PPM;
+
+        // 2 полосы: встречка (слева) + попутная (справа)
+        const asphaltW = 2 * L;
+        const cx = canvas.width / 2;
+        const leftX  = cx - asphaltW / 2;
+        const rightX = cx + asphaltW / 2;
+        const topY   = canvas.height / 2 - roadLen / 2;
+        const botY   = canvas.height / 2 + roadLen / 2;
+
+        const objs = [];
+
+        // Асфальт
+        objs.push({ type: 'fill', x: leftX, y: topY, w: asphaltW, h: roadLen, color: '#6e6e6e' });
+
+        // Бордюры — узкие прямоугольники по бокам, с коллизией
+        objs.push({ type: 'barrier',
+          x: leftX - SH - CW, y: topY, w: CW, h: roadLen, color: '#d8d2c3' });
+        objs.push({ type: 'barrier',
+          x: rightX + SH, y: topY, w: CW, h: roadLen, color: '#d8d2c3' });
+
+        // Центральная одинарная сплошная с разрывом для разворота
+        const gapH   = 10 * PPM;
+        const gapTop = canvas.height / 2 - gapH / 2;
+        const gapBot = canvas.height / 2 + gapH / 2;
+        objs.push({ type: 'line',
+          x1: cx, y1: topY, x2: cx, y2: gapTop,
+          color: '#f4d03f', width: 2 });
+        objs.push({ type: 'line',
+          x1: cx, y1: gapBot, x2: cx, y2: botY,
+          color: '#f4d03f', width: 2 });
+
+        // Стартовая позиция: центр попутной (правой) полосы, чуть ниже разрыва,
+        // носом вверх.
+        return {
+          start: { x: cx + L / 2, y: gapBot + 8 * PPM, heading: -Math.PI / 2 },
+          objects: objs
+        };
+      }
+    },
+    road4: {
+      label: 'Разворот на 4-полосной',
+      build() {
+        // Параметры в метрах, переводим в пиксели через PPM
+        const laneW_m   = 3.5;                 // ширина одной полосы
+        const curbW_m   = 0.30;                // толщина бордюра
+        const shoulder  = 0.20;                // зазор между асфальтом и бордюром (эстетика)
+        const roadLen_m = 200;                 // длина участка дороги по вертикали
+        const L = laneW_m * PPM;
+        const CW = curbW_m * PPM;
+        const SH = shoulder * PPM;
+        const roadLen = roadLen_m * PPM;
+
+        // Общая ширина асфальта: 4 полосы
+        const asphaltW = 4 * L;
+        // Центр дороги по X — центр экрана
+        const cx = canvas.width / 2;
+        // Левый и правый края асфальта
+        const leftX  = cx - asphaltW / 2;
+        const rightX = cx + asphaltW / 2;
+        // Верх и низ участка — с запасом выше/ниже экрана
+        const topY   = canvas.height / 2 - roadLen / 2;
+        const botY   = canvas.height / 2 + roadLen / 2;
+
+        const objs = [];
+
+        // Асфальт (без коллизии, только фон)
+        objs.push({ type: 'fill', x: leftX, y: topY, w: asphaltW, h: roadLen, color: '#6e6e6e' });
+
+        // Бордюры: высокие узкие прямоугольники с коллизией
+        objs.push({ type: 'barrier',
+          x: leftX - SH - CW, y: topY, w: CW, h: roadLen, color: '#d8d2c3' });
+        objs.push({ type: 'barrier',
+          x: rightX + SH, y: topY, w: CW, h: roadLen, color: '#d8d2c3' });
+
+        // Центральная двойная сплошная с разрывом для поворота.
+        // Разрыв ~10 м по центру дороги.
+        const gapH   = 10 * PPM;
+        const gapTop = canvas.height / 2 - gapH / 2;
+        const gapBot = canvas.height / 2 + gapH / 2;
+        const dblOff = 3; // смещение каждой линии от осевой
+        // Левая и правая линии двойной сплошной — два сегмента: выше и ниже разрыва
+        for (const ox of [-dblOff, +dblOff]) {
+          objs.push({ type: 'line',
+            x1: cx + ox, y1: topY, x2: cx + ox, y2: gapTop,
+            color: '#f4d03f', width: 2 });
+          objs.push({ type: 'line',
+            x1: cx + ox, y1: gapBot, x2: cx + ox, y2: botY,
+            color: '#f4d03f', width: 2 });
+        }
+
+        // Прерывистые линии: разделители между полосами одного направления.
+        // Попутное (справа от оси) делится между полосой 3 (ближняя к оси)
+        // и полосой 4 (крайняя правая). Встречное (слева) — зеркально.
+        for (const lx of [cx - L, cx + L]) {
+          objs.push({ type: 'line',
+            x1: lx, y1: topY, x2: lx, y2: botY,
+            color: '#efefef', width: 2, dash: [18, 14] });
+        }
+
+        // Стартовая позиция: 3-я полоса (левая полоса направления «вверх»
+        // при правостороннем движении). Полосы, считая слева направо (встречка,
+        // встречка, попутная-левая, попутная-правая): центр полосы 3 = cx + L/2.
+        // По вертикали — чуть ниже разрыва разметки, чтобы разрыв был перед носом.
+        return {
+          start: { x: cx + L / 2, y: gapBot + 8 * PPM, heading: -Math.PI / 2 },
+          objects: objs
+        };
+      }
+    }
+  };
+
+  // Текущее окружение (env и collided уже объявлены выше — до reset())
+  function setEnvironment(key) {
+    const def = ENVIRONMENTS[key] || ENVIRONMENTS.empty;
+    const built = def.build();
+    env.objects = built.objects;
+    env.start   = built.start;
+    env.key     = key;
+
+    // Подсветка активной кнопки
+    document.querySelectorAll('#envPanel button').forEach(b => {
+      b.classList.toggle('active', b.dataset.env === key);
+    });
+
+    // По ТЗ: смена окружения очищает следы и рулетки.
+    state.tracks       = [[[]], [[]], [[]], [[]]];
+    state.trackColors  = [dirtyColor()];
+    ruler.pending      = null;
+    ruler.segments     = [];
+
+    // Переместить машину в стартовую позицию окружения
+    if (env.start) {
+      state.x = env.start.x; state.y = env.start.y;
+      state.heading = env.start.heading;
+    } else {
+      state.x = canvas.width / 2; state.y = canvas.height / 2;
+      state.heading = -Math.PI / 2;
+    }
+    state.deltaF = 0; state.deltaR = 0; state.dir = 0;
+    collided = false;
+  }
+
+  // ---------- Коллизии ----------
+  // Каркас машины: 4 угла прямоугольника кузова в мировых координатах.
+  function carCorners(s) {
+    const hL = CAR.bodyLen / 2, hW = CAR.bodyWid / 2;
+    const ch = Math.cos(s.heading), sh = Math.sin(s.heading);
+    const local = [[+hL,-hW],[+hL,+hW],[-hL,+hW],[-hL,-hW]];
+    return local.map(([lx, ly]) => ({
+      x: s.x + lx * ch - ly * sh,
+      y: s.y + lx * sh + ly * ch
+    }));
+  }
+  // Пересечение двух отрезков (a→b и c→d). Используется для SAT-упрощённого
+  // теста: проверяем пересечение сторон прямоугольника кузова со сторонами
+  // барьера. Плюс покрываем случай «корпус целиком внутри барьера».
+  function segIntersect(a, b, c, d) {
+    const d1x = b.x - a.x, d1y = b.y - a.y;
+    const d2x = d.x - c.x, d2y = d.y - c.y;
+    const denom = d1x * d2y - d1y * d2x;
+    if (Math.abs(denom) < 1e-9) return false;
+    const t = ((c.x - a.x) * d2y - (c.y - a.y) * d2x) / denom;
+    const u = ((c.x - a.x) * d1y - (c.y - a.y) * d1x) / denom;
+    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+  }
+  function pointInRect(p, r) {
+    return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+  }
+  function carHitsAnyBarrier(s) {
+    const corners = carCorners(s);
+    for (const o of env.objects) {
+      if (o.type !== 'barrier') continue;
+      // (1) любой угол кузова внутри барьера
+      for (const p of corners) if (pointInRect(p, o)) return true;
+      // (2) пересечение сторон кузова со сторонами барьера
+      const rc = [
+        { x: o.x,       y: o.y       },
+        { x: o.x + o.w, y: o.y       },
+        { x: o.x + o.w, y: o.y + o.h },
+        { x: o.x,       y: o.y + o.h }
+      ];
+      for (let i = 0; i < 4; i++) {
+        const a = corners[i], b = corners[(i + 1) % 4];
+        for (let j = 0; j < 4; j++) {
+          const c = rc[j], d = rc[(j + 1) % 4];
+          if (segIntersect(a, b, c, d)) return true;
+        }
+      }
+    }
+    return false;
+  }
 
   // ---------- Камера (zoom + pan) ----------
   // Мировые координаты (s.x, s.y, следы, рулетки) остаются в «игровых пикселях»
@@ -254,6 +689,12 @@ Esc — убрать все рулетки</div>
   document.querySelectorAll('.action-btn').forEach(btn => {
     btn.addEventListener('click', e => { e.preventDefault(); handleAction(btn.dataset.action); });
   });
+
+  // Кнопки выбора окружения (только десктоп, на мобиле панель скрыта CSS-ом)
+  document.querySelectorAll('#envPanel button').forEach(btn => {
+    btn.addEventListener('click', () => setEnvironment(btn.dataset.env));
+  });
+  setEnvironment('empty');
 
   canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
@@ -376,10 +817,17 @@ Esc — убрать все рулетки</div>
     let steerTarget = 0;
     if (keys['ArrowLeft'])  steerTarget -= 1;
     if (keys['ArrowRight']) steerTarget += 1;
+    // Направление движения считаем здесь же — нужно для условного автовозврата
+    const moving = !!(keys['ArrowUp'] || keys['ArrowDown']);
     if (steerTarget !== 0) {
       s.deltaF += steerTarget * CAR.steerSpeed * dt;
+    } else if (moving) {
+      // Автовозврат руля к нулю — только во время движения, на месте колёса
+      // остаются в последнем заданном положении.
+      const ret = CAR.steerReturn * dt;
+      if (Math.abs(s.deltaF) <= ret) s.deltaF = 0;
+      else s.deltaF -= Math.sign(s.deltaF) * ret;
     }
-    // автовозврат руля к нулю отключён — колёса остаются в последнем положении
     if (s.deltaF >  maxFront) s.deltaF =  maxFront;
     if (s.deltaF < -maxFront) s.deltaF = -maxFront;
 
@@ -396,6 +844,7 @@ Esc — убрать все рулетки</div>
     // параллельны), либо поворот всей машины вокруг мгновенного центра
     // вращения (ICR). Так гарантируется идеально круговая траектория при
     // постоянных углах колёс — без дрейфа радиуса.
+    const prevX = s.x, prevY = s.y, prevHeading = s.heading;
     const L  = CAR.length;
     const v  = CAR.speed * s.dir * dt;   // знаковое перемещение задней оси за шаг
     const dr = s.deltaR, df = s.deltaF;
@@ -429,6 +878,17 @@ Esc — убрать все рулетки</div>
       s.x = icrX + c * dx - si * dy;
       s.y = icrY + si * dx + c * dy;
       s.heading += dTheta;
+    }
+
+    // 4. Проверка коллизии корпуса с барьерами окружения. При контакте —
+    // откат к предыдущему положению и пометка, что машина «упёрлась».
+    // Пользователь может сдавать назад / выруливать.
+    if (carHitsAnyBarrier(s)) {
+      s.x = prevX; s.y = prevY; s.heading = prevHeading;
+      collided = true;
+      return;
+    } else {
+      collided = false;
     }
 
     // 5. Запись следов колёс — в последний (текущий) сегмент каждого колеса
@@ -663,10 +1123,11 @@ Esc — убрать все рулетки</div>
     const dFR = Math.hypot(wp.FR.x - icr.x, wp.FR.y - icr.y);
     const R = Math.max(dFL, dFR);
     const invZ = 1 / view.zoom;
+    const asphalt = onAsphalt();
     ctx.save();
-    ctx.strokeStyle = 'rgba(50,100,170,0.45)';
+    ctx.strokeStyle = asphalt ? 'rgba(180,210,255,0.85)' : 'rgba(50,100,170,0.45)';
     ctx.setLineDash([6 * invZ, 6 * invZ]);
-    ctx.lineWidth = 1 * invZ;
+    ctx.lineWidth = (asphalt ? 1.5 : 1) * invZ;
     ctx.beginPath();
     ctx.arc(icr.x, icr.y, R, 0, Math.PI * 2);
     ctx.stroke();
@@ -682,10 +1143,14 @@ Esc — убрать все рулетки</div>
     const outer = dFL > dFR ? wp.FL : wp.FR;
     const R = Math.max(dFL, dFR);
     const invZ = 1 / view.zoom;
+    const asphalt = onAsphalt();
+    const lineCol = asphalt ? 'rgba(210,230,255,0.95)' : 'rgba(50,100,170,0.95)';
+    const textCol = asphalt ? '#eaf2ff' : '#2a5a99';
+    const bgCol   = asphalt ? '#2e2e2e' : '#f2efe9';
 
     ctx.save();
     // Линия радиуса — от ICR до внешнего переднего колеса
-    ctx.strokeStyle = 'rgba(50,100,170,0.95)';
+    ctx.strokeStyle = lineCol;
     ctx.lineWidth = 1.5 * invZ;
     ctx.beginPath();
     ctx.moveTo(icr.x, icr.y);
@@ -693,12 +1158,12 @@ Esc — убрать все рулетки</div>
     ctx.stroke();
 
     // Точка ICR
-    ctx.fillStyle = 'rgba(50,100,170,0.95)';
+    ctx.fillStyle = lineCol;
     ctx.beginPath();
     ctx.arc(icr.x, icr.y, 3 * invZ, 0, Math.PI * 2);
     ctx.fill();
     ctx.font = (11 * invZ) + 'px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-    ctx.fillStyle = '#2a5a99';
+    ctx.fillStyle = textCol;
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
     ctx.fillText('ICR', icr.x + 6 * invZ, icr.y + 4 * invZ);
@@ -714,9 +1179,9 @@ Esc — убрать все рулетки</div>
     ctx.textBaseline = 'middle';
     ctx.textAlign    = 'center';
     ctx.lineWidth    = 3 * invZ;
-    ctx.strokeStyle  = '#f2efe9';
+    ctx.strokeStyle  = bgCol;
     ctx.strokeText(text, mx, my);
-    ctx.fillStyle    = '#2a5a99';
+    ctx.fillStyle    = textCol;
     ctx.fillText(text, mx, my);
     ctx.restore();
   }
@@ -740,12 +1205,38 @@ Esc — убрать все рулетки</div>
     anglesEl.textContent = `${line1}\n${line2}`;
   }
 
+  function drawEnvironment() {
+    for (const o of env.objects) {
+      if (o.type === 'fill') {
+        ctx.fillStyle = o.color || '#888';
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+      } else if (o.type === 'barrier') {
+        ctx.fillStyle   = o.color || '#d8d2c3';
+        ctx.strokeStyle = '#8a8472';
+        ctx.lineWidth   = 1 / view.zoom;
+        ctx.fillRect(o.x, o.y, o.w, o.h);
+        ctx.strokeRect(o.x, o.y, o.w, o.h);
+      } else if (o.type === 'line') {
+        ctx.save();
+        ctx.strokeStyle = o.color || '#fff';
+        ctx.lineWidth   = (o.width || 2);
+        if (o.dash) ctx.setLineDash(o.dash);
+        ctx.beginPath();
+        ctx.moveTo(o.x1, o.y1);
+        ctx.lineTo(o.x2, o.y2);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
   function render() {
     ctx.fillStyle = '#f2efe9';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.save();
     ctx.translate(view.offsetX, view.offsetY);
     ctx.scale(view.zoom, view.zoom);
+    drawEnvironment();      // асфальт, разметка, бордюры — под всем
     drawTracks();
     drawTurnCircleBack();   // пунктирная окружность — под машиной
     drawCar();
